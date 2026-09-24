@@ -175,9 +175,9 @@ def get_price(article, retries=2):
                 if rh.status_code == 200:
                     hist = rh.json()
                     if isinstance(hist, list) and hist:
-                        # Берём последнюю запись с ценой
+                        # Ищем последнюю запись с ценой
                         for entry in reversed(hist):
-                            price_kop = entry.get("price") or entry.get("salePriceU")
+                            price_kop = entry.get("price")
                             if price_kop:
                                 logging.info(f"[WB] CDN {basket} price-history сработал: {price_kop // 100} ₽")
                                 return {"name": f"Товар {article}", "price": price_kop // 100}
