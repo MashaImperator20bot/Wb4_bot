@@ -144,61 +144,37 @@ def get_price(article, retries=2):
         for basket_num in range(1, 31):
             basket = f"{basket_num:02d}"
 
-            # 1. Пробуем card.json — там название и часто цена
-            url = (
+            # 1. Получаем card.json — там название и цена
+            url_card = (
                 f"https://basket-{basket}.wbbasket.ru"
                 f"/vol{vol}/part{part}/{article}/info/ru/card.json"
             )
             try:
-                r = curl_requests.get(url, impersonate="chrome120", timeout=8)
+                r = curl_requests.get(url_card, impersonate="chrome120", timeout=8)
                 if r.status_code == 200:
-                    data = r.json()
-                    name = data.get("imt_name") or data.get("subj_name") or f"Товар {article}"
-                    price_kop = (
-                        data.get("salePriceU")
-                        or data.get("priceU")
-                        or data.get("price")
-                    )
+                    card = r.json()
+                    name = card.get("imt_name") or card.get("subj_name") or f"Товар {article}"
+
+                    # Цена в копейках, лежит в sizes[].price.product
+                    sizes = card.get("sizes", [])
+                    if sizes and sizes[0].get("price"):
+                        price_kop = (
+                            sizes[0]["price"].get("product")
+                            or sizes[0]["price"].get("basic")
+                        )
+                        if price_kop:
+                            logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽")
+                            return {"name": name, "price": price_kop // 100}
+
+                    # Запасной вариант: salePriceU / priceU
+                    price_kop = card.get("salePriceU") or card.get("priceU")
                     if price_kop:
-                        logging.info(f"[WB] CDN {basket} card.json сработал: {name} — {price_kop // 100} ₽")
+                        logging.info(f"[WB] CDN {basket} (salePriceU): {name} — {price_kop // 100} ₽")
                         return {"name": name, "price": price_kop // 100}
+
             except Exception as e:
                 logging.debug(f"[WB] card.json CDN {basket}: {type(e).__name__}")
-
-            # 2. Пробуем price-history.json — там история цен
-            url_hist = (
-                f"https://basket-{basket}.wbbasket.ru"
-                f"/vol{vol}/part{part}/{article}/info/price-history.json"
-            )
-            try:
-                rh = curl_requests.get(url_hist, impersonate="chrome120", timeout=8)
-                if rh.status_code == 200:
-                    hist = rh.json()
-                    if isinstance(hist, list) and hist:
-                        # Ищем последнюю запись с ценой
-                        for entry in reversed(hist):
-                            price_kop = entry.get("price")
-                            if price_kop:
-                                logging.info(f"[WB] CDN {basket} price-history сработал: {price_kop // 100} ₽")
-                                return {"name": f"Товар {article}", "price": price_kop // 100}
-            except Exception as e:
-                logging.debug(f"[WB] price-history CDN {basket}: {type(e).__name__}")
-
-            # 3. Пробуем price.json — вдруг где-то он всё-таки есть
-            url_price = (
-                f"https://basket-{basket}.wbbasket.ru"
-                f"/vol{vol}/part{part}/{article}/info/price.json"
-            )
-            try:
-                rp = curl_requests.get(url_price, impersonate="chrome120", timeout=8)
-                if rp.status_code == 200:
-                    pd = rp.json()
-                    price_kop = pd.get("price") or pd.get("salePriceU") or pd.get("priceU")
-                    if price_kop:
-                        logging.info(f"[WB] CDN {basket} price.json сработал: {price_kop // 100} ₽")
-                        return {"name": f"Товар {article}", "price": price_kop // 100}
-            except Exception:
-                pass
+                continue
 
     logging.error(f"[WB] Не удалось получить цену для {article}")
     return None
