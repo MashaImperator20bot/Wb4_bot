@@ -16,18 +16,18 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ============ НАСТРОЙКИ ============
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # токен берётся из переменной окружения хостинга
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN не задан. Добавьте переменную окружения BOT_TOKEN "
         "в настройках хостинга (не храните токен в коде!)."
     )
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))   # твой user_id (для /grant), 0 = отключено
-CHECK_INTERVAL = 30               # как часто проверять цены (минуты)
-FREE_LIMIT = 3                    # товаров бесплатно
-PREMIUM_LIMIT = 20                # товаров в Premium
-PREMIUM_PRICE = 100               # Stars за 30 дней
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHECK_INTERVAL = 30
+FREE_LIMIT = 3
+PREMIUM_LIMIT = 20
+PREMIUM_PRICE = 100
 PREMIUM_DAYS = 30
 DB_PATH = "wb_bot.db"
 # ====================================
@@ -135,72 +135,61 @@ async def is_premium(user_id):
                 return bool(res[0])
 
 
-# ============ WILDBERRIES API ============
+# ============ WILDBERRIES API (с отладкой) ============
 def get_price(article, retries=3):
-    """
-    Получает цену товара с Wildberries.
-    Пробует несколько эндпоинтов и User-Agent, делает ретраи.
-    Возвращает {'name': str, 'price': int} или None.
-    """
     endpoints = [
         "https://card.wb.ru/cards/v4/detail",
         "https://card.wb.ru/cards/detail",
     ]
-
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
     ]
 
     for attempt in range(retries):
         for url in endpoints:
-            params = {
-                "appType": 1,
-                "curr": "rub",
-                "dest": -1257786,
-                "spp": 30,
-                "nm": article,
-            }
+            params = {"appType": 1, "curr": "rub", "dest": -1257786, "spp": 30, "nm": article}
             headers = {
                 "User-Agent": random.choice(user_agents),
                 "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
+                "Accept-Language": "ru-RU,ru;q=0.9",
             }
+            logging.info(f"[WB] Запрос #{attempt + 1}: {url} nm={article}")
 
             try:
                 r = curl_requests.get(
                     url,
                     params=params,
                     headers=headers,
-                    impersonate="chrome",
+                    impersonate="chrome120",
                     timeout=15,
                 )
+                logging.info(f"[WB] Статус: {r.status_code}, длина ответа: {len(r.text)}")
+                logging.info(f"[WB] Первые 300 символов: {r.text[:300]}")
+
                 if r.status_code in (403, 429):
-                    logging.warning(
-                        f"WB вернул {r.status_code} для {article} "
-                        f"(попытка {attempt + 1}, {url})"
-                    )
                     time.sleep(random.uniform(1.5, 3.0))
                     continue
 
                 r.raise_for_status()
-                products = r.json().get("data", {}).get("products", [])
+                data = r.json()
+                logging.info(f"[WB] Ключи верхнего уровня: {list(data.keys())}")
+
+                products = data.get("data", {}).get("products", [])
+                logging.info(f"[WB] Найдено товаров: {len(products)}")
+
                 if not products:
-                    return None
+                    continue
 
                 p = products[0]
                 name = p.get("name", f"Товар {article}")
                 sizes = p.get("sizes", [])
+                logging.info(f"[WB] sizes: {sizes[:1] if sizes else 'пусто'}")
+                logging.info(f"[WB] salePriceU={p.get('salePriceU')}, priceU={p.get('priceU')}")
 
                 if sizes and sizes[0].get("price"):
-                    price_kop = (
-                        sizes[0]["price"].get("product")
-                        or sizes[0]["price"].get("basic")
-                    )
+                    price_kop = sizes[0]["price"].get("product") or sizes[0]["price"].get("basic")
                     if price_kop:
                         return {"name": name, "price": price_kop // 100}
 
@@ -212,17 +201,12 @@ def get_price(article, retries=3):
                 if price_u:
                     return {"name": name, "price": price_u // 100}
 
-                continue
-
             except Exception as e:
-                logging.error(f"WB API error ({url}, попытка {attempt + 1}): {e}")
-                time.sleep(random.uniform(1.5, 3.0))
+                logging.error(f"[WB] Ошибка ({type(e).__name__}): {e}")
+                time.sleep(random.uniform(1.0, 2.0))
                 continue
 
-        if attempt < retries - 1:
-            time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
-
-    logging.error(f"Не удалось получить цену для артикула {article} после {retries} попыток")
+    logging.error(f"[WB] Не удалось получить цену для {article}")
     return None
 
 
