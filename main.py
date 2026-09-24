@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+from urllib.parse import quote
 
 import aiosqlite
 from curl_cffi import requests as curl_requests
@@ -20,7 +21,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN не задан. Добавьте переменную окружения BOT_TOKEN "
-        "в настройках хостинга (не храните токен в коде!)."
+        "в настройках хостинга."
     )
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -135,66 +136,50 @@ async def is_premium(user_id):
                 return bool(res[0])
 
 
-# ============ WILDBERRIES API (с отладкой) ============
-def get_price(article, retries=3):
-    endpoints = [
-        "https://card.wb.ru/cards/v4/detail",
-        "https://card.wb.ru/cards/detail",
-    ]
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
+# ============ WILDBERRIES API через бесплатные прокси ============
+def get_price(article, retries=2):
+    wb_url = (
+        f"https://card.wb.ru/cards/v4/detail"
+        f"?appType=1&curr=rub&dest=-1257786&spp=30&nm={article}"
+    )
+    encoded = quote(wb_url, safe="")
+
+    proxies = [
+        f"https://api.allorigins.win/raw?url={encoded}",
+        f"https://corsproxy.io/?url={encoded}",
+        f"https://api.codetabs.com/v1/proxy?quest={encoded}",
+        f"https://thingproxy.freeboard.io/fetch/{wb_url}",
     ]
 
     for attempt in range(retries):
-        for url in endpoints:
-            params = {"appType": 1, "curr": "rub", "dest": -1257786, "spp": 30, "nm": article}
-            headers = {
-                "User-Agent": random.choice(user_agents),
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "ru-RU,ru;q=0.9",
-            }
-            logging.info(f"[WB] Запрос #{attempt + 1}: {url} nm={article}")
-
+        for proxy_url in proxies:
             try:
-                r = curl_requests.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    impersonate="chrome120",
-                    timeout=15,
-                )
-                logging.info(f"[WB] Статус: {r.status_code}, длина ответа: {len(r.text)}")
-                logging.info(f"[WB] Первые 300 символов: {r.text[:300]}")
+                logging.info(f"[WB] Попытка {attempt + 1}, прокси: {proxy_url[:70]}")
+                r = curl_requests.get(proxy_url, impersonate="chrome120", timeout=20)
+                logging.info(f"[WB] Статус: {r.status_code}, длина: {len(r.text)}")
 
-                if r.status_code in (403, 429):
-                    time.sleep(random.uniform(1.5, 3.0))
+                if r.status_code != 200:
                     continue
 
-                r.raise_for_status()
                 data = r.json()
-                logging.info(f"[WB] Ключи верхнего уровня: {list(data.keys())}")
-
                 products = data.get("data", {}).get("products", [])
-                logging.info(f"[WB] Найдено товаров: {len(products)}")
-
                 if not products:
+                    logging.warning("[WB] Товары не найдены в ответе")
                     continue
 
                 p = products[0]
                 name = p.get("name", f"Товар {article}")
                 sizes = p.get("sizes", [])
-                logging.info(f"[WB] sizes: {sizes[:1] if sizes else 'пусто'}")
-                logging.info(f"[WB] salePriceU={p.get('salePriceU')}, priceU={p.get('priceU')}")
 
                 if sizes and sizes[0].get("price"):
                     price_kop = sizes[0]["price"].get("product") or sizes[0]["price"].get("basic")
                     if price_kop:
+                        logging.info(f"[WB] Успех: {name} — {price_kop // 100} ₽")
                         return {"name": name, "price": price_kop // 100}
 
                 sale = p.get("salePriceU")
                 if sale:
+                    logging.info(f"[WB] Успех (salePriceU): {name} — {sale // 100} ₽")
                     return {"name": name, "price": sale // 100}
 
                 price_u = p.get("priceU")
@@ -203,10 +188,10 @@ def get_price(article, retries=3):
 
             except Exception as e:
                 logging.error(f"[WB] Ошибка ({type(e).__name__}): {e}")
-                time.sleep(random.uniform(1.0, 2.0))
+                time.sleep(random.uniform(0.5, 1.5))
                 continue
 
-    logging.error(f"[WB] Не удалось получить цену для {article}")
+    logging.error(f"[WB] Все прокси не сработали для {article}")
     return None
 
 
@@ -467,6 +452,7 @@ async def check_prices():
     items = await get_all_items()
     for item_id, user_id, article, name, old_price, target, mode in items:
         data = get_price(article)
+        await asyncio.sleep(2)  # пауза между товарами, чтобы не забанили
         if not data:
             continue
         new_price = data["price"]
