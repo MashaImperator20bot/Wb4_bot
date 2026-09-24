@@ -137,6 +137,15 @@ async def is_premium(user_id):
 
 
 # ============ WILDBERRIES: ЦЕНА ЧЕРЕЗ CDN ============
+def _extract_price_kop(price_obj):
+    """Цена может быть числом или словарём {'RUB': 38040}."""
+    if price_obj is None:
+        return None
+    if isinstance(price_obj, dict):
+        return price_obj.get("RUB")
+    return price_obj
+
+
 def get_price(article, retries=2):
     vol = article // 100000
     part = article // 1000
@@ -145,7 +154,7 @@ def get_price(article, retries=2):
         for basket_num in range(1, MAX_BASKET + 1):
             basket = f"{basket_num:02d}"
 
-            # 1. Название и цена из card.json
+            # 1. Название из card.json
             name = f"Товар {article}"
             url_card = (
                 f"https://basket-{basket}.wbbasket.ru"
@@ -156,27 +165,10 @@ def get_price(article, retries=2):
                 if r.status_code == 200:
                     card = r.json()
                     name = card.get("imt_name") or card.get("subj_name") or name
-
-                    # Пробуем разные возможные места для цены
-                    sizes = card.get("sizes", [])
-                    if sizes and sizes[0].get("price"):
-                        price_kop = (
-                            sizes[0]["price"].get("product")
-                            or sizes[0]["price"].get("basic")
-                        )
-                        if price_kop:
-                            logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽ (card sizes)")
-                            return {"name": name, "price": price_kop // 100}
-
-                    # Запас: salePriceU/priceU
-                    for key in ("salePriceU", "priceU", "price"):
-                        if card.get(key):
-                            logging.info(f"[WB] CDN {basket}: {name} — {card[key] // 100} ₽ ({key})")
-                            return {"name": name, "price": card[key] // 100}
             except Exception as e:
                 logging.debug(f"[WB] card.json CDN {basket}: {type(e).__name__}")
 
-            # 2. Запас: price-history.json
+            # 2. Цена из price-history.json
             url_hist = (
                 f"https://basket-{basket}.wbbasket.ru"
                 f"/vol{vol}/part{part}/{article}/info/price-history.json"
@@ -186,11 +178,12 @@ def get_price(article, retries=2):
                 if rh.status_code == 200:
                     hist = rh.json()
                     if isinstance(hist, list) and hist:
-                        for entry in reversed(hist):
-                            price_kop = entry.get("price")
-                            if price_kop:
-                                logging.info(f"[WB] CDN {basket} (hist): {name} — {price_kop // 100} ₽")
-                                return {"name": name, "price": price_kop // 100}
+                        # Берём последнюю запись (самая свежая цена)
+                        entry = hist[-1]
+                        price_kop = _extract_price_kop(entry.get("price"))
+                        if price_kop:
+                            logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽")
+                            return {"name": name, "price": price_kop // 100}
             except Exception as e:
                 logging.debug(f"[WB] price-history CDN {basket}: {type(e).__name__}")
 
@@ -279,7 +272,7 @@ async def help_handler(call: types.CallbackQuery):
     await call.answer()
 
 
-# --- Диагностика: /test ---
+# --- Диагностика ---
 @dp.message(Command("test"))
 async def test_cdn(message: types.Message):
     article = 1465864387
@@ -290,7 +283,6 @@ async def test_cdn(message: types.Message):
     vol = article // 100000
     part = article // 1000
 
-    # Ищем рабочий CDN
     working_basket = None
     for i in range(1, MAX_BASKET + 1):
         b = f"{i:02d}"
@@ -307,38 +299,15 @@ async def test_cdn(message: types.Message):
         await message.answer("❌ Ни один CDN не вернул 200")
         return
 
-    await message.answer(f"✅ Рабочий CDN: {working_basket}. Артикул: {article}. vol={vol}, part={part}")
+    await message.answer(f"✅ CDN: {working_basket}, артикул: {article}, vol={vol}, part={part}")
 
-    # card.json целиком
-    url_card = f"https://basket-{working_basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info/ru/card.json"
-    try:
-        r = curl_requests.get(url_card, impersonate="chrome120", timeout=10)
-        card_text = r.text
-        await message.answer(f"<b>card.json</b> (длина {len(card_text)}):\n<pre>{card_text[:3800]}</pre>")
-        if len(card_text) > 3800:
-            await message.answer(f"<b>card.json — окончание:</b>\n<pre>{card_text[-3800:]}</pre>")
-    except Exception as e:
-        await message.answer(f"Ошибка card.json: {type(e).__name__}: {e}")
-
-    # price-history.json целиком
     url_hist = f"https://basket-{working_basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info/price-history.json"
     try:
         rh = curl_requests.get(url_hist, impersonate="chrome120", timeout=10)
         hist_text = rh.text
-        await message.answer(f"<b>price-history.json</b> (статус {rh.status_code}, длина {len(hist_text)}):\n<pre>{hist_text[:3800]}</pre>")
-        if len(hist_text) > 3800:
-            await message.answer(f"<b>price-history — окончание:</b>\n<pre>{hist_text[-3800:]}</pre>")
+        await message.answer(f"<b>price-history</b> ({rh.status_code}):\n<pre>{hist_text[:3800]}</pre>")
     except Exception as e:
-        await message.answer(f"Ошибка price-history.json: {type(e).__name__}: {e}")
-
-    # price.json на всякий случай
-    url_price = f"https://basket-{working_basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info/price.json"
-    try:
-        rp = curl_requests.get(url_price, impersonate="chrome120", timeout=10)
-        price_text = rp.text
-        await message.answer(f"<b>price.json</b> (статус {rp.status_code}):\n<pre>{price_text[:3800]}</pre>")
-    except Exception as e:
-        await message.answer(f"Ошибка price.json: {type(e).__name__}: {e}")
+        await message.answer(f"Ошибка: {type(e).__name__}: {e}")
 
 
 # --- Добавление ---
@@ -377,7 +346,7 @@ async def add_link(message: types.Message, state: FSMContext):
     data = get_price(article)
 
     if not data:
-        await msg.edit_text("❌ Не смог получить цену. Отправь /test с этим артикулом для диагностики.")
+        await msg.edit_text("❌ Не смог получить цену. Проверь артикул или попробуй позже.")
         return
 
     await msg.delete()
