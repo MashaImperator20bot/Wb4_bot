@@ -4,7 +4,7 @@ import os
 import re
 
 import aiosqlite
-import requests
+from curl_cffi import requests as curl_requests
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -137,9 +137,8 @@ async def is_premium(user_id):
 def get_price(article):
     url = "https://card.wb.ru/cards/v4/detail"
     params = {"appType": 1, "curr": "rub", "dest": -1257786, "spp": 30, "nm": article}
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=15)
+        r = curl_requests.get(url, params=params, impersonate="chrome", timeout=15)
         r.raise_for_status()
         products = r.json().get("data", {}).get("products", [])
         if not products:
