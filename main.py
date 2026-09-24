@@ -141,10 +141,11 @@ def get_price(article, retries=2):
     part = article // 1000
 
     for attempt in range(retries):
-        for basket_num in range(1, 31):
+        for basket_num in range(1, 51):
             basket = f"{basket_num:02d}"
 
-            # 1. Получаем card.json — там название и цена
+            # 1. Название из card.json
+            name = f"Товар {article}"
             url_card = (
                 f"https://basket-{basket}.wbbasket.ru"
                 f"/vol{vol}/part{part}/{article}/info/ru/card.json"
@@ -153,28 +154,28 @@ def get_price(article, retries=2):
                 r = curl_requests.get(url_card, impersonate="chrome120", timeout=8)
                 if r.status_code == 200:
                     card = r.json()
-                    name = card.get("imt_name") or card.get("subj_name") or f"Товар {article}"
-
-                    # Цена в копейках, лежит в sizes[].price.product
-                    sizes = card.get("sizes", [])
-                    if sizes and sizes[0].get("price"):
-                        price_kop = (
-                            sizes[0]["price"].get("product")
-                            or sizes[0]["price"].get("basic")
-                        )
-                        if price_kop:
-                            logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽")
-                            return {"name": name, "price": price_kop // 100}
-
-                    # Запасной вариант: salePriceU / priceU
-                    price_kop = card.get("salePriceU") or card.get("priceU")
-                    if price_kop:
-                        logging.info(f"[WB] CDN {basket} (salePriceU): {name} — {price_kop // 100} ₽")
-                        return {"name": name, "price": price_kop // 100}
-
+                    name = card.get("imt_name") or card.get("subj_name") or name
+                    logging.info(f"[WB] CDN {basket}: card.json OK, название: {name}")
             except Exception as e:
                 logging.debug(f"[WB] card.json CDN {basket}: {type(e).__name__}")
-                continue
+
+            # 2. Цена из price-history.json
+            url_hist = (
+                f"https://basket-{basket}.wbbasket.ru"
+                f"/vol{vol}/part{part}/{article}/info/price-history.json"
+            )
+            try:
+                rh = curl_requests.get(url_hist, impersonate="chrome120", timeout=8)
+                if rh.status_code == 200:
+                    hist = rh.json()
+                    if isinstance(hist, list) and hist:
+                        for entry in reversed(hist):
+                            price_kop = entry.get("price")
+                            if price_kop:
+                                logging.info(f"[WB] CDN {basket}: цена {price_kop // 100} ₽")
+                                return {"name": name, "price": price_kop // 100}
+            except Exception as e:
+                logging.debug(f"[WB] price-history CDN {basket}: {type(e).__name__}")
 
     logging.error(f"[WB] Не удалось получить цену для {article}")
     return None
@@ -261,6 +262,46 @@ async def help_handler(call: types.CallbackQuery):
     await call.answer()
 
 
+# --- ДИАГНОСТИКА: /test ---
+@dp.message(Command("test"))
+async def test_cdn(message: types.Message):
+    article = 1465864387  # можно заменить на свой артикул
+    args = message.text.split()
+    if len(args) > 1 and args[1].isdigit():
+        article = int(args[1])
+
+    vol = article // 100000
+    part = article // 1000
+
+    lines = [f"Артикул: {article}", f"vol={vol}, part={part}", ""]
+    found = None
+
+    for i in range(1, 51):
+        b = f"{i:02d}"
+        url = f"https://basket-{b}.wbbasket.ru/vol{vol}/part{part}/{article}/info/ru/card.json"
+        try:
+            r = curl_requests.get(url, impersonate="chrome120", timeout=5)
+            lines.append(f"CDN {b}: {r.status_code}")
+            if r.status_code == 200 and found is None:
+                found = (b, r.text[:400])
+        except Exception as e:
+            lines.append(f"CDN {b}: {type(e).__name__}")
+
+    if found:
+        lines.append("")
+        lines.append(f"✅ Рабочий CDN: {found[0]}")
+        lines.append(f"card.json: {found[1]}")
+    else:
+        lines.append("")
+        lines.append("❌ Ни один CDN не вернул 200")
+
+    # Telegram лимит 4096 символов
+    result = "\n".join(lines)
+    if len(result) > 4000:
+        result = result[:4000]
+    await message.answer(f"<pre>{result}</pre>")
+
+
 # --- Добавление ---
 @dp.callback_query(F.data == "add")
 async def add_start(call: types.CallbackQuery, state: FSMContext):
@@ -297,7 +338,9 @@ async def add_link(message: types.Message, state: FSMContext):
     data = get_price(article)
 
     if not data:
-        await msg.edit_text("❌ Не смог получить цену. Проверь артикул или попробуй позже.")
+        await msg.edit_text(
+            "❌ Не смог получить цену. Отправь /test чтобы посмотреть диагностику."
+        )
         return
 
     await msg.delete()
