@@ -4,7 +4,6 @@ import os
 import random
 import re
 import time
-from urllib.parse import quote
 
 import aiosqlite
 from curl_cffi import requests as curl_requests
@@ -136,62 +135,49 @@ async def is_premium(user_id):
                 return bool(res[0])
 
 
-# ============ WILDBERRIES API через бесплатные прокси ============
+# ============ WILDBERRIES: ЦЕНА ЧЕРЕЗ CDN ============
 def get_price(article, retries=2):
-    wb_url = (
-        f"https://card.wb.ru/cards/v4/detail"
-        f"?appType=1&curr=rub&dest=-1257786&spp=30&nm={article}"
-    )
-    encoded = quote(wb_url, safe="")
-
-    proxies = [
-        f"https://api.allorigins.win/raw?url={encoded}",
-        f"https://corsproxy.io/?url={encoded}",
-        f"https://api.codetabs.com/v1/proxy?quest={encoded}",
-        f"https://thingproxy.freeboard.io/fetch/{wb_url}",
-    ]
+    vol = article // 100000
+    part = article // 1000
 
     for attempt in range(retries):
-        for proxy_url in proxies:
+        for basket_num in range(1, 31):
+            basket = f"{basket_num:02d}"
+            url = (
+                f"https://basket-{basket}.wbbasket.ru"
+                f"/vol{vol}/part{part}/{article}/info/price.json"
+            )
             try:
-                logging.info(f"[WB] Попытка {attempt + 1}, прокси: {proxy_url[:70]}")
-                r = curl_requests.get(proxy_url, impersonate="chrome120", timeout=20)
-                logging.info(f"[WB] Статус: {r.status_code}, длина: {len(r.text)}")
-
+                r = curl_requests.get(url, impersonate="chrome120", timeout=8)
                 if r.status_code != 200:
                     continue
 
+                logging.info(f"[WB] CDN {basket} сработал")
                 data = r.json()
-                products = data.get("data", {}).get("products", [])
-                if not products:
-                    logging.warning("[WB] Товары не найдены в ответе")
+                price_kop = data.get("price")
+                if not price_kop:
                     continue
 
-                p = products[0]
-                name = p.get("name", f"Товар {article}")
-                sizes = p.get("sizes", [])
+                name = f"Товар {article}"
+                try:
+                    card_url = (
+                        f"https://basket-{basket}.wbbasket.ru"
+                        f"/vol{vol}/part{part}/{article}/info/ru/card.json"
+                    )
+                    rc = curl_requests.get(card_url, impersonate="chrome120", timeout=8)
+                    if rc.status_code == 200:
+                        card = rc.json()
+                        name = card.get("imt_name") or card.get("subj_name") or name
+                except Exception:
+                    pass
 
-                if sizes and sizes[0].get("price"):
-                    price_kop = sizes[0]["price"].get("product") or sizes[0]["price"].get("basic")
-                    if price_kop:
-                        logging.info(f"[WB] Успех: {name} — {price_kop // 100} ₽")
-                        return {"name": name, "price": price_kop // 100}
-
-                sale = p.get("salePriceU")
-                if sale:
-                    logging.info(f"[WB] Успех (salePriceU): {name} — {sale // 100} ₽")
-                    return {"name": name, "price": sale // 100}
-
-                price_u = p.get("priceU")
-                if price_u:
-                    return {"name": name, "price": price_u // 100}
+                return {"name": name, "price": price_kop // 100}
 
             except Exception as e:
-                logging.error(f"[WB] Ошибка ({type(e).__name__}): {e}")
-                time.sleep(random.uniform(0.5, 1.5))
+                logging.debug(f"[WB] CDN {basket}: {type(e).__name__}")
                 continue
 
-    logging.error(f"[WB] Все прокси не сработали для {article}")
+    logging.error(f"[WB] CDN не сработали для {article}")
     return None
 
 
@@ -307,10 +293,15 @@ async def add_link(message: types.Message, state: FSMContext):
         await message.answer("❌ Не вижу артикул. Пришли ссылку WB или число (например, 12345678).")
         return
     article = int(match.group(1))
+
+    msg = await message.answer("🔍 Ищу цену, подожди 3–10 секунд...")
     data = get_price(article)
+
     if not data:
-        await message.answer("❌ Не смог получить цену. Проверь артикул или попробуй позже.")
+        await msg.edit_text("❌ Не смог получить цену. Проверь артикул или попробуй позже.")
         return
+
+    await msg.delete()
     await state.update_data(article=article, name=data["name"], current_price=data["price"])
     await message.answer(
         f"📦 <b>{data['name']}</b>\n"
@@ -452,7 +443,7 @@ async def check_prices():
     items = await get_all_items()
     for item_id, user_id, article, name, old_price, target, mode in items:
         data = get_price(article)
-        await asyncio.sleep(2)  # пауза между товарами, чтобы не забанили
+        await asyncio.sleep(2)
         if not data:
             continue
         new_price = data["price"]
