@@ -287,10 +287,13 @@ def _get_price_live(article, retries=3):
     Это не персональная цена конкретного пользователя (скидка WB Кошелька,
     промокоды всё ещё не учитываются), но заметно свежее, чем CDN.
 
-    Риск ограничений здесь выше, чем у чистого CDN, поэтому запрос:
-    - идёт с браузерными заголовками и имперсонацией Chrome
-    - делает случайные паузы между попытками
-    - отдельно обрабатывает 429 (rate-limit) увеличенной паузой
+    Имитация браузера через curl_cffi (impersonate="chrome120") подделывает
+    TLS/HTTP-отпечаток запроса под настоящий Chrome, плюс:
+    - браузерные заголовки (Accept, Accept-Language, Referer)
+    - случайные паузы между попытками
+    - отдельная обработка 429 (rate-limit) увеличенной паузой
+    Если это не помогает — вызывающий код (get_price) переключается
+    на старый CDN-способ ("по старинке").
     """
     dest = -1257786  # код региона доставки (Москва); влияет на итоговую цену
     url = (
@@ -416,7 +419,8 @@ def _get_price_cdn_old(article, retries=2):
 
 def get_price(article, retries=3):
     """
-    1. Живой API card.wb.ru — основной источник, задержка в часах.
+    1. Живой API card.wb.ru (с имитацией браузера) — основной источник,
+       задержка в часах.
     2. Если не ответил — "по старинке": полный старый перебор CDN
        (card.json, price-history.json, price.json). Задержка там может
        быть больше (часы-дни в зависимости от файла), зато почти не
@@ -621,6 +625,46 @@ async def test_cdn(message: types.Message):
                     await message.answer(f"<b>{name} — продолжение:</b>\n<pre>{rest}</pre>")
         except Exception as e:
             await message.answer(f"Ошибка чтения {name}: {type(e).__name__}: {e}")
+
+
+# --- Диагностика: /testlive — проверка живого API card.wb.ru (только админ) ---
+@dp.message(Command("testlive"))
+async def test_live(message: types.Message):
+    if not is_admin(message):
+        return
+
+    article = 1465864387
+    args = message.text.split()
+    if len(args) > 1 and args[1].isdigit():
+        article = int(args[1])
+
+    dest = -1257786
+    url = (
+        "https://card.wb.ru/cards/v2/detail"
+        f"?appType=1&curr=rub&dest={dest}&spp=30&nm={article}"
+    )
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Referer": f"https://www.wildberries.ru/catalog/{article}/detail.aspx",
+    }
+
+    await message.answer(f"🔍 Дёргаю live API для артикула {article}...")
+
+    try:
+        r = curl_requests.get(url, impersonate="chrome120", headers=headers, timeout=10)
+        await message.answer(f"Статус: <b>{r.status_code}</b>, длина ответа: {len(r.text)}")
+
+        text = r.text
+        if len(text) <= 3800:
+            await message.answer(f"<pre>{text}</pre>")
+        else:
+            await message.answer(f"<pre>{text[:3800]}</pre>")
+            rest = text[3800:7600]
+            if rest:
+                await message.answer(f"<b>Продолжение:</b>\n<pre>{rest}</pre>")
+    except Exception as e:
+        await message.answer(f"Ошибка запроса: {type(e).__name__}: {e}")
 
 
 # --- Добавление ---
