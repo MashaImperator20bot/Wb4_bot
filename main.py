@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import random
 import re
 import time
 
@@ -23,8 +22,8 @@ if not BOT_TOKEN:
         "в настройках хостинга."
     )
 
-ADMIN_USERNAME = "UnstableBro"   # без @ — твой юзернейм
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # можно не задавать
+ADMIN_USERNAME = "UnstableBro"
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 CHECK_INTERVAL = 30
 FREE_CONCURRENT = 3
@@ -45,7 +44,6 @@ scheduler = AsyncIOScheduler()
 
 # ============ ПРОВЕРКА АДМИНА ============
 def is_admin(message_or_call) -> bool:
-    """Админ — по ID (если задан) или по юзернейму."""
     user = message_or_call.from_user
     if ADMIN_ID != 0 and user.id == ADMIN_ID:
         return True
@@ -250,18 +248,6 @@ async def get_total_items():
 
 
 # ============ WILDBERRIES: ЦЕНА ЧЕРЕЗ CDN ============
-def _extract_price_kop(price_obj):
-    if price_obj is None:
-        return None
-    if isinstance(price_obj, dict):
-        for k in ("RUB", "rub"):
-            if k in price_obj:
-                return price_obj[k]
-        vals = list(price_obj.values())
-        return vals[0] if vals else None
-    return price_obj
-
-
 def _find_working_basket(article):
     vol = article // 100000
     part = article // 1000
@@ -277,89 +263,32 @@ def _find_working_basket(article):
     return None
 
 
-def _get_price_live(article, retries=3):
-    """
-    Источник цены — "живой" API card.wb.ru, которым пользуется сам сайт
-    wildberries.ru. Даёт актуальную цену с задержкой в пределах часов
-    (а не дней, как статичные файлы на CDN — там цены для многих товаров
-    сейчас вообще нет).
-
-    Это не персональная цена конкретного пользователя (скидка WB Кошелька,
-    промокоды всё ещё не учитываются), но заметно свежее, чем CDN.
-
-    Имитация браузера через curl_cffi (impersonate="chrome120") подделывает
-    TLS/HTTP-отпечаток запроса под настоящий Chrome, плюс:
-    - браузерные заголовки (Accept, Accept-Language, Referer)
-    - случайные паузы между попытками
-    - отдельная обработка 429 (rate-limit) увеличенной паузой
-    Если это не помогает — вызывающий код (get_price) переключается
-    на старый CDN-способ ("по старинке").
-    """
-    dest = -1257786  # код региона доставки (Москва); влияет на итоговую цену
-    url = (
-        "https://card.wb.ru/cards/v2/detail"
-        f"?appType=1&curr=rub&dest={dest}&spp=30&nm={article}"
-    )
-    headers = {
-        "Accept": "*/*",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Referer": f"https://www.wildberries.ru/catalog/{article}/detail.aspx",
-    }
-
-    for attempt in range(retries):
-        try:
-            r = curl_requests.get(url, impersonate="chrome120", headers=headers, timeout=8)
-            if r.status_code == 200:
-                data = r.json()
-                products = data.get("data", {}).get("products", [])
-                if products:
-                    p = products[0]
-                    name = p.get("name") or f"Товар {article}"
-                    price_kop = None
-
-                    sizes = p.get("sizes", [])
-                    if sizes:
-                        price_obj = sizes[0].get("price", {})
-                        price_kop = price_obj.get("product") or price_obj.get("basic")
-
-                    if not price_kop:
-                        price_kop = p.get("salePriceU") or p.get("priceU")
-
-                    if price_kop:
-                        price = round(price_kop / 100)
-                        logging.info(f"[WB] live API: {name} — {price} ₽")
-                        return {"name": name, "price": price}
-            elif r.status_code == 429:
-                logging.warning(f"[WB] 429 rate-limit, article={article}, пауза дольше")
-                time.sleep(random.uniform(5, 10))
-        except Exception as e:
-            logging.debug(f"[WB] live API attempt {attempt}: {type(e).__name__}: {e}")
-
-        time.sleep(random.uniform(1.5, 3.5))
-
-    return None
+def _price_from_obj(price_obj):
+    """Цена может быть числом или словарём {'RUB': 38040}."""
+    if price_obj is None:
+        return None
+    if isinstance(price_obj, dict):
+        for k in ("RUB", "rub"):
+            if k in price_obj:
+                return price_obj[k]
+        vals = list(price_obj.values())
+        return vals[0] if vals else None
+    return price_obj
 
 
-def _get_price_cdn_old(article, retries=2):
-    """
-    "По старинке" — старый способ через CDN Wildberries (basket-XX.wbbasket.ru).
-    Перебирает card.json, price-history.json и price.json — как было в
-    самой первой версии бота. Используется только как запасной вариант,
-    если живой API (_get_price_live) не смог ответить.
-    """
+def get_price(article, retries=2):
     vol = article // 100000
     part = article // 1000
 
     for attempt in range(retries):
         basket = _find_working_basket(article)
         if not basket:
-            time.sleep(random.uniform(1, 2))
             continue
 
         base = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info"
         name = f"Товар {article}"
 
-        # 1. card.json
+        # 1. card.json — цена продавца в sizes[0].price.product
         try:
             r = curl_requests.get(f"{base}/ru/card.json", impersonate="chrome120", timeout=8)
             if r.status_code == 200:
@@ -373,69 +302,26 @@ def _get_price_cdn_old(article, retries=2):
                         or sizes[0]["price"].get("basic")
                     )
                     if price_kop:
-                        logging.info(f"[WB] CDN card.json {basket}: {name} — {price_kop // 100} ₽")
+                        logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽ (card)")
                         return {"name": name, "price": price_kop // 100}
-
-                for key in ("salePriceU", "priceU", "price"):
-                    v = card.get(key)
-                    if isinstance(v, int) and v:
-                        logging.info(f"[WB] CDN card.json {basket}: {name} — {v // 100} ₽ ({key})")
-                        return {"name": name, "price": v // 100}
         except Exception as e:
-            logging.debug(f"[WB] CDN card.json {basket}: {type(e).__name__}")
+            logging.debug(f"[WB] card.json CDN {basket}: {type(e).__name__}")
 
-        # 2. price-history.json (последняя запись)
+        # 2. price-history.json — если в card.json цены нет
         try:
             rh = curl_requests.get(f"{base}/price-history.json", impersonate="chrome120", timeout=8)
             if rh.status_code == 200:
                 hist = rh.json()
                 if isinstance(hist, list) and hist:
-                    last = hist[-1]
-                    price_kop = _extract_price_kop(last.get("price"))
+                    entry = hist[-1]
+                    price_kop = _price_from_obj(entry.get("price"))
                     if price_kop:
-                        logging.info(f"[WB] CDN price-history {basket}: {name} — {price_kop // 100} ₽")
+                        logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽ (hist)")
                         return {"name": name, "price": price_kop // 100}
         except Exception as e:
-            logging.debug(f"[WB] CDN price-history {basket}: {type(e).__name__}")
+            logging.debug(f"[WB] price-history CDN {basket}: {type(e).__name__}")
 
-        # 3. price.json
-        try:
-            rp = curl_requests.get(f"{base}/price.json", impersonate="chrome120", timeout=8)
-            if rp.status_code == 200:
-                pd = rp.json()
-                price_kop = pd.get("price") or pd.get("salePriceU") or pd.get("priceU")
-                if isinstance(price_kop, dict):
-                    price_kop = _extract_price_kop(price_kop)
-                if isinstance(price_kop, int) and price_kop:
-                    logging.info(f"[WB] CDN price.json {basket}: {name} — {price_kop // 100} ₽")
-                    return {"name": name, "price": price_kop // 100}
-        except Exception as e:
-            logging.debug(f"[WB] CDN price.json {basket}: {type(e).__name__}")
-
-        time.sleep(random.uniform(1, 2))
-
-    return None
-
-
-def get_price(article, retries=3):
-    """
-    1. Живой API card.wb.ru (с имитацией браузера) — основной источник,
-       задержка в часах.
-    2. Если не ответил — "по старинке": полный старый перебор CDN
-       (card.json, price-history.json, price.json). Задержка там может
-       быть больше (часы-дни в зависимости от файла), зато почти не
-       создаёт риска и работает как надёжная подстраховка.
-    """
-    data = _get_price_live(article, retries=retries)
-    if data:
-        return data
-
-    logging.warning(f"[WB] live API не дал цену для {article}, пробую по старинке (CDN)")
-    data = _get_price_cdn_old(article)
-    if data:
-        return data
-
-    logging.error(f"[WB] Не удалось получить цену для {article} (ни live, ни CDN)")
+    logging.error(f"[WB] Не удалось получить цену для {article}")
     return None
 
 
@@ -542,7 +428,9 @@ async def help_handler(call: types.CallbackQuery):
         "• <b>Любое снижение</b> — напишет при первом падении.\n"
         "• <b>Мои товары</b> — список, можно удалять.\n\n"
         f"<b>Лимиты:</b> {FREE_TOTAL_LIMIT} добавлений бесплатно, +{REFERRAL_BONUS} за друга. "
-        f"Premium снимает лимит.",
+        f"Premium снимает лимит.\n\n"
+        "⚠️ Цена, которую показывает бот — <b>цена продавца</b> без учёта скидки WB. "
+        "Точную смотри на сайте по ссылке.",
         reply_markup=back_kb()
     )
     await call.answer()
@@ -572,7 +460,7 @@ async def referral_info(call: types.CallbackQuery):
     await call.answer()
 
 
-# --- Диагностика: /test ---
+# --- Диагностика ---
 @dp.message(Command("test"))
 async def test_cdn(message: types.Message):
     article = 1465864387
@@ -582,89 +470,23 @@ async def test_cdn(message: types.Message):
 
     vol = article // 100000
     part = article // 1000
-
     basket = _find_working_basket(article)
     if not basket:
-        await message.answer("❌ Ни один CDN не вернул 200 на card.json")
+        await message.answer("❌ Ни один CDN не вернул 200")
         return
-
-    await message.answer(f"✅ CDN: {basket}, артикул: {article}, vol={vol}, part={part}")
 
     base = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info"
+    await message.answer(f"✅ CDN {basket}, артикул {article}")
 
-    files = [
-        ("card.json", f"{base}/ru/card.json"),
-        ("price-history.json", f"{base}/price-history.json"),
-        ("price.json", f"{base}/price.json"),
-        ("sale.json", f"{base}/sale.json"),
-    ]
-
-    summary = []
-    for name, url in files:
+    for fname in ("ru/card.json", "price-history.json"):
         try:
-            r = curl_requests.get(url, impersonate="chrome120", timeout=10)
-            summary.append(f"{name}: {r.status_code}, длина {len(r.text)}")
+            r = curl_requests.get(f"{base}/{fname}", impersonate="chrome120", timeout=10)
+            txt = r.text
+            await message.answer(
+                f"<b>{fname}</b> ({r.status_code}, {len(txt)}):\n<pre>{txt[:3500]}</pre>"
+            )
         except Exception as e:
-            summary.append(f"{name}: {type(e).__name__}")
-
-    await message.answer("📊 <b>Статусы:</b>\n<pre>" + "\n".join(summary) + "</pre>")
-
-    for name, url in files:
-        try:
-            r = curl_requests.get(url, impersonate="chrome120", timeout=10)
-            if r.status_code != 200:
-                continue
-            text = r.text
-            header = f"<b>{name}</b> (длина {len(text)}):"
-            if len(text) <= 3800:
-                await message.answer(f"{header}\n<pre>{text}</pre>")
-            else:
-                await message.answer(f"{header}\n<pre>{text[:3800]}</pre>")
-                rest = text[3800:7600]
-                if rest:
-                    await message.answer(f"<b>{name} — продолжение:</b>\n<pre>{rest}</pre>")
-        except Exception as e:
-            await message.answer(f"Ошибка чтения {name}: {type(e).__name__}: {e}")
-
-
-# --- Диагностика: /testlive — проверка живого API card.wb.ru (только админ) ---
-@dp.message(Command("testlive"))
-async def test_live(message: types.Message):
-    if not is_admin(message):
-        return
-
-    article = 1465864387
-    args = message.text.split()
-    if len(args) > 1 and args[1].isdigit():
-        article = int(args[1])
-
-    dest = -1257786
-    url = (
-        "https://card.wb.ru/cards/v2/detail"
-        f"?appType=1&curr=rub&dest={dest}&spp=30&nm={article}"
-    )
-    headers = {
-        "Accept": "*/*",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Referer": f"https://www.wildberries.ru/catalog/{article}/detail.aspx",
-    }
-
-    await message.answer(f"🔍 Дёргаю live API для артикула {article}...")
-
-    try:
-        r = curl_requests.get(url, impersonate="chrome120", headers=headers, timeout=10)
-        await message.answer(f"Статус: <b>{r.status_code}</b>, длина ответа: {len(r.text)}")
-
-        text = r.text
-        if len(text) <= 3800:
-            await message.answer(f"<pre>{text}</pre>")
-        else:
-            await message.answer(f"<pre>{text[:3800]}</pre>")
-            rest = text[3800:7600]
-            if rest:
-                await message.answer(f"<b>Продолжение:</b>\n<pre>{rest}</pre>")
-    except Exception as e:
-        await message.answer(f"Ошибка запроса: {type(e).__name__}: {e}")
+            await message.answer(f"{fname}: {type(e).__name__}: {e}")
 
 
 # --- Добавление ---
@@ -738,7 +560,7 @@ async def add_link(message: types.Message, state: FSMContext):
     data = get_price(article)
 
     if not data:
-        await msg.edit_text("❌ Не смог получить цену. Отправь /test с артикулом — покажет, что вернул CDN.")
+        await msg.edit_text("❌ Не смог получить цену. Проверь артикул или попробуй позже.")
         return
 
     await msg.delete()
@@ -746,7 +568,8 @@ async def add_link(message: types.Message, state: FSMContext):
     await message.answer(
         f"📦 <b>{data['name']}</b>\n"
         f"Артикул: <code>{article}</code>\n"
-        f"Текущая цена: <b>{data['price']} ₽</b>\n\n"
+        f"Цена продавца: <b>{data['price']} ₽</b>\n"
+        f"<i>Точная цена на сайте может быть ниже — учитывается скидка WB.</i>\n\n"
         f"Выбери режим слежки:",
         reply_markup=mode_kb()
     )
@@ -809,7 +632,7 @@ async def list_items(call: types.CallbackQuery):
     kb = []
     for article, name, current, target, mode in items:
         mode_str = f"до {target} ₽" if mode == "target" else "любое снижение"
-        text += f"• <b>{name}</b>\n  Артикул: <code>{article}</code>\n  Текущая: {current} ₽ | {mode_str}\n\n"
+        text += f"• <b>{name}</b>\n  Артикул: <code>{article}</code>\n  Цена: {current} ₽ | {mode_str}\n\n"
         kb.append([InlineKeyboardButton(text=f"🗑 Удалить {article}", callback_data=f"del_{article}")])
     kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -953,48 +776,43 @@ async def stats(message: types.Message):
 
 # ============ ФОНОВАЯ ПРОВЕРКА ============
 async def check_prices():
-    """
-    Проверяет все отслеживаемые товары.
-    Запросы к WB растянуты по времени (со случайными паузами), а не идут
-    пачкой подряд — так нагрузка на WB размазывается на весь интервал
-    между проверками, что снижает риск ограничений/бана по IP.
-    """
     logging.info("Проверка цен...")
     items = await get_all_items()
-    if not items:
-        return
-
-    # живой API (card.wb.ru) рискованнее по нагрузке, чем чистый CDN,
-    # поэтому пауза между товарами больше — растягиваем почти на весь
-    # CHECK_INTERVAL, а не бьём WB пачкой за несколько секунд
-    delay_between = max(4, (CHECK_INTERVAL * 60) / len(items) * 0.7)
-
     for item_id, user_id, article, name, old_price, target, mode in items:
         data = get_price(article)
+        await asyncio.sleep(2)
+        if not data:
+            continue
+        new_price = data["price"]
+        if new_price == old_price:
+            continue
 
-        if data:
-            new_price = data["price"]
-            if new_price != old_price:
-                notify = False
-                if mode == "target" and target and new_price <= target:
-                    notify = True
-                elif mode == "any_drop" and new_price < old_price:
-                    notify = True
-                if notify:
-                    try:
-                        await bot.send_message(
-                            user_id,
-                            f"🔔 <b>Цена упала!</b>\n\n"
-                            f"📦 {name}\n"
-                            f"Артикул: <code>{article}</code>\n"
-                            f"Было: {old_price} ₽ → Стало: <b>{new_price} ₽</b>\n\n"
-                            f"https://wildberries.ru/catalog/{article}/detail.aspx"
-                        )
-                    except Exception as e:
-                        logging.error(f"Не смог отправить {user_id}: {e}")
-                await update_price(item_id, new_price)
+        notify = False
+        if mode == "target" and target and new_price <= target:
+            notify = True
+        elif mode == "any_drop" and new_price < old_price:
+            notify = True
 
-        await asyncio.sleep(delay_between + random.uniform(-1, 2))
+        if notify:
+            diff = old_price - new_price
+            percent = round(diff / old_price * 100, 1) if old_price else 0
+
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"🔔 <b>Цена упала!</b>\n\n"
+                    f"📦 {name}\n"
+                    f"Артикул: <code>{article}</code>\n\n"
+                    f"Было: <s>{old_price} ₽</s>\n"
+                    f"Стало: <b>{new_price} ₽</b>\n"
+                    f"📉 Скидка: <b>−{diff} ₽</b> ({percent}%)\n\n"
+                    f"<i>Цена продавца. Точную смотри на WB.</i>\n"
+                    f"https://wildberries.ru/catalog/{article}/detail.aspx"
+                )
+            except Exception as e:
+                logging.error(f"Не смог отправить {user_id}: {e}")
+
+        await update_price(item_id, new_price)
 
 
 # ============ ЗАПУСК ============
