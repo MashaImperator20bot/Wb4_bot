@@ -277,19 +277,30 @@ def _find_working_basket(article):
     return None
 
 
-def get_price(article, retries=2):
+def get_price(article, retries=3):
+    """
+    Источник цены — card.json на CDN Wildberries.
+    Это кэш карточки товара, который синхронизируется заметно чаще
+    (обычно в пределах часов), чем архив price-history.json (дни).
+    Не даёт персональных скидок (WB Кошелёк, промокоды) — только базовую
+    цену продавца/каталога, но зато безопасен по нагрузке на WB.
+
+    Если card.json совсем не отдал цену за все попытки — используется
+    запасной вариант price-history.json (последняя известная запись).
+    """
     vol = article // 100000
     part = article // 1000
 
     for attempt in range(retries):
         basket = _find_working_basket(article)
         if not basket:
+            time.sleep(random.uniform(1, 2))
             continue
 
         base = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info"
-
-        # 1. card.json
         name = f"Товар {article}"
+
+        # 1. card.json — основной источник, обновляется чаще всего
         try:
             r = curl_requests.get(f"{base}/ru/card.json", impersonate="chrome120", timeout=8)
             if r.status_code == 200:
@@ -303,44 +314,37 @@ def get_price(article, retries=2):
                         or sizes[0]["price"].get("basic")
                     )
                     if price_kop:
-                        logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽ (card)")
+                        logging.info(f"[WB] card.json {basket}: {name} — {price_kop // 100} ₽")
                         return {"name": name, "price": price_kop // 100}
 
                 for key in ("salePriceU", "priceU", "price"):
                     v = card.get(key)
                     if isinstance(v, int) and v:
-                        logging.info(f"[WB] CDN {basket}: {name} — {v // 100} ₽ (card.{key})")
+                        logging.info(f"[WB] card.json {basket}: {name} — {v // 100} ₽ ({key})")
                         return {"name": name, "price": v // 100}
         except Exception as e:
-            logging.debug(f"[WB] card.json CDN {basket}: {type(e).__name__}")
+            logging.debug(f"[WB] card.json {basket}: {type(e).__name__}")
 
-        # 2. price-history.json
+        time.sleep(random.uniform(1, 2))
+
+    # 2. Fallback — если card.json совсем не дал цену за все попытки
+    logging.warning(f"[WB] card.json не дал цену для {article}, пробую price-history")
+    basket = _find_working_basket(article)
+    if basket:
+        base = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info"
         try:
             rh = curl_requests.get(f"{base}/price-history.json", impersonate="chrome120", timeout=8)
             if rh.status_code == 200:
                 hist = rh.json()
                 if isinstance(hist, list) and hist:
-                    for entry in reversed(hist):
-                        price_kop = _extract_price_kop(entry.get("price"))
-                        if price_kop:
-                            logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽ (hist)")
-                            return {"name": name, "price": price_kop // 100}
+                    last = hist[-1]
+                    price_kop = _extract_price_kop(last.get("price"))
+                    if price_kop:
+                        name = f"Товар {article}"
+                        logging.info(f"[WB] price-history {basket}: {name} — {price_kop // 100} ₽ (fallback)")
+                        return {"name": name, "price": price_kop // 100}
         except Exception as e:
-            logging.debug(f"[WB] price-history CDN {basket}: {type(e).__name__}")
-
-        # 3. price.json
-        try:
-            rp = curl_requests.get(f"{base}/price.json", impersonate="chrome120", timeout=8)
-            if rp.status_code == 200:
-                pd = rp.json()
-                price_kop = pd.get("price") or pd.get("salePriceU") or pd.get("priceU")
-                if isinstance(price_kop, dict):
-                    price_kop = _extract_price_kop(price_kop)
-                if isinstance(price_kop, int) and price_kop:
-                    logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽ (price.json)")
-                    return {"name": name, "price": price_kop // 100}
-        except Exception as e:
-            logging.debug(f"[WB] price.json CDN {basket}: {type(e).__name__}")
+            logging.debug(f"[WB] price-history fallback {basket}: {type(e).__name__}")
 
     logging.error(f"[WB] Не удалось получить цену для {article}")
     return None
@@ -820,34 +824,45 @@ async def stats(message: types.Message):
 
 # ============ ФОНОВАЯ ПРОВЕРКА ============
 async def check_prices():
+    """
+    Проверяет все отслеживаемые товары.
+    Запросы к WB растянуты по времени (со случайными паузами), а не идут
+    пачкой подряд — так нагрузка на WB размазывается на весь интервал
+    между проверками, что снижает риск ограничений/бана по IP.
+    """
     logging.info("Проверка цен...")
     items = await get_all_items()
+    if not items:
+        return
+
+    delay_between = max(2, (CHECK_INTERVAL * 60) / len(items) * 0.5)
+
     for item_id, user_id, article, name, old_price, target, mode in items:
         data = get_price(article)
-        await asyncio.sleep(2)
-        if not data:
-            continue
-        new_price = data["price"]
-        if new_price == old_price:
-            continue
-        notify = False
-        if mode == "target" and target and new_price <= target:
-            notify = True
-        elif mode == "any_drop" and new_price < old_price:
-            notify = True
-        if notify:
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"🔔 <b>Цена упала!</b>\n\n"
-                    f"📦 {name}\n"
-                    f"Артикул: <code>{article}</code>\n"
-                    f"Было: {old_price} ₽ → Стало: <b>{new_price} ₽</b>\n\n"
-                    f"https://wildberries.ru/catalog/{article}/detail.aspx"
-                )
-            except Exception as e:
-                logging.error(f"Не смог отправить {user_id}: {e}")
-        await update_price(item_id, new_price)
+
+        if data:
+            new_price = data["price"]
+            if new_price != old_price:
+                notify = False
+                if mode == "target" and target and new_price <= target:
+                    notify = True
+                elif mode == "any_drop" and new_price < old_price:
+                    notify = True
+                if notify:
+                    try:
+                        await bot.send_message(
+                            user_id,
+                            f"🔔 <b>Цена упала!</b>\n\n"
+                            f"📦 {name}\n"
+                            f"Артикул: <code>{article}</code>\n"
+                            f"Было: {old_price} ₽ → Стало: <b>{new_price} ₽</b>\n\n"
+                            f"https://wildberries.ru/catalog/{article}/detail.aspx"
+                        )
+                    except Exception as e:
+                        logging.error(f"Не смог отправить {user_id}: {e}")
+                await update_price(item_id, new_price)
+
+        await asyncio.sleep(delay_between + random.uniform(-1, 2))
 
 
 # ============ ЗАПУСК ============
