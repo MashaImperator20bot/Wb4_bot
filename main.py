@@ -277,16 +277,72 @@ def _find_working_basket(article):
     return None
 
 
-def get_price(article, retries=3):
+def _get_price_live(article, retries=3):
     """
-    Источник цены — card.json на CDN Wildberries.
-    Это кэш карточки товара, который синхронизируется заметно чаще
-    (обычно в пределах часов), чем архив price-history.json (дни).
-    Не даёт персональных скидок (WB Кошелёк, промокоды) — только базовую
-    цену продавца/каталога, но зато безопасен по нагрузке на WB.
+    Источник цены — "живой" API card.wb.ru, которым пользуется сам сайт
+    wildberries.ru. Даёт актуальную цену с задержкой в пределах часов
+    (а не дней, как статичные файлы на CDN — там цены для многих товаров
+    сейчас вообще нет).
 
-    Если card.json совсем не отдал цену за все попытки — используется
-    запасной вариант price-history.json (последняя известная запись).
+    Это не персональная цена конкретного пользователя (скидка WB Кошелька,
+    промокоды всё ещё не учитываются), но заметно свежее, чем CDN.
+
+    Риск ограничений здесь выше, чем у чистого CDN, поэтому запрос:
+    - идёт с браузерными заголовками и имперсонацией Chrome
+    - делает случайные паузы между попытками
+    - отдельно обрабатывает 429 (rate-limit) увеличенной паузой
+    """
+    dest = -1257786  # код региона доставки (Москва); влияет на итоговую цену
+    url = (
+        "https://card.wb.ru/cards/v2/detail"
+        f"?appType=1&curr=rub&dest={dest}&spp=30&nm={article}"
+    )
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Referer": f"https://www.wildberries.ru/catalog/{article}/detail.aspx",
+    }
+
+    for attempt in range(retries):
+        try:
+            r = curl_requests.get(url, impersonate="chrome120", headers=headers, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                products = data.get("data", {}).get("products", [])
+                if products:
+                    p = products[0]
+                    name = p.get("name") or f"Товар {article}"
+                    price_kop = None
+
+                    sizes = p.get("sizes", [])
+                    if sizes:
+                        price_obj = sizes[0].get("price", {})
+                        price_kop = price_obj.get("product") or price_obj.get("basic")
+
+                    if not price_kop:
+                        price_kop = p.get("salePriceU") or p.get("priceU")
+
+                    if price_kop:
+                        price = round(price_kop / 100)
+                        logging.info(f"[WB] live API: {name} — {price} ₽")
+                        return {"name": name, "price": price}
+            elif r.status_code == 429:
+                logging.warning(f"[WB] 429 rate-limit, article={article}, пауза дольше")
+                time.sleep(random.uniform(5, 10))
+        except Exception as e:
+            logging.debug(f"[WB] live API attempt {attempt}: {type(e).__name__}: {e}")
+
+        time.sleep(random.uniform(1.5, 3.5))
+
+    return None
+
+
+def _get_price_cdn_old(article, retries=2):
+    """
+    "По старинке" — старый способ через CDN Wildberries (basket-XX.wbbasket.ru).
+    Перебирает card.json, price-history.json и price.json — как было в
+    самой первой версии бота. Используется только как запасной вариант,
+    если живой API (_get_price_live) не смог ответить.
     """
     vol = article // 100000
     part = article // 1000
@@ -300,7 +356,7 @@ def get_price(article, retries=3):
         base = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info"
         name = f"Товар {article}"
 
-        # 1. card.json — основной источник, обновляется чаще всего
+        # 1. card.json
         try:
             r = curl_requests.get(f"{base}/ru/card.json", impersonate="chrome120", timeout=8)
             if r.status_code == 200:
@@ -314,24 +370,18 @@ def get_price(article, retries=3):
                         or sizes[0]["price"].get("basic")
                     )
                     if price_kop:
-                        logging.info(f"[WB] card.json {basket}: {name} — {price_kop // 100} ₽")
+                        logging.info(f"[WB] CDN card.json {basket}: {name} — {price_kop // 100} ₽")
                         return {"name": name, "price": price_kop // 100}
 
                 for key in ("salePriceU", "priceU", "price"):
                     v = card.get(key)
                     if isinstance(v, int) and v:
-                        logging.info(f"[WB] card.json {basket}: {name} — {v // 100} ₽ ({key})")
+                        logging.info(f"[WB] CDN card.json {basket}: {name} — {v // 100} ₽ ({key})")
                         return {"name": name, "price": v // 100}
         except Exception as e:
-            logging.debug(f"[WB] card.json {basket}: {type(e).__name__}")
+            logging.debug(f"[WB] CDN card.json {basket}: {type(e).__name__}")
 
-        time.sleep(random.uniform(1, 2))
-
-    # 2. Fallback — если card.json совсем не дал цену за все попытки
-    logging.warning(f"[WB] card.json не дал цену для {article}, пробую price-history")
-    basket = _find_working_basket(article)
-    if basket:
-        base = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info"
+        # 2. price-history.json (последняя запись)
         try:
             rh = curl_requests.get(f"{base}/price-history.json", impersonate="chrome120", timeout=8)
             if rh.status_code == 200:
@@ -340,13 +390,48 @@ def get_price(article, retries=3):
                     last = hist[-1]
                     price_kop = _extract_price_kop(last.get("price"))
                     if price_kop:
-                        name = f"Товар {article}"
-                        logging.info(f"[WB] price-history {basket}: {name} — {price_kop // 100} ₽ (fallback)")
+                        logging.info(f"[WB] CDN price-history {basket}: {name} — {price_kop // 100} ₽")
                         return {"name": name, "price": price_kop // 100}
         except Exception as e:
-            logging.debug(f"[WB] price-history fallback {basket}: {type(e).__name__}")
+            logging.debug(f"[WB] CDN price-history {basket}: {type(e).__name__}")
 
-    logging.error(f"[WB] Не удалось получить цену для {article}")
+        # 3. price.json
+        try:
+            rp = curl_requests.get(f"{base}/price.json", impersonate="chrome120", timeout=8)
+            if rp.status_code == 200:
+                pd = rp.json()
+                price_kop = pd.get("price") or pd.get("salePriceU") or pd.get("priceU")
+                if isinstance(price_kop, dict):
+                    price_kop = _extract_price_kop(price_kop)
+                if isinstance(price_kop, int) and price_kop:
+                    logging.info(f"[WB] CDN price.json {basket}: {name} — {price_kop // 100} ₽")
+                    return {"name": name, "price": price_kop // 100}
+        except Exception as e:
+            logging.debug(f"[WB] CDN price.json {basket}: {type(e).__name__}")
+
+        time.sleep(random.uniform(1, 2))
+
+    return None
+
+
+def get_price(article, retries=3):
+    """
+    1. Живой API card.wb.ru — основной источник, задержка в часах.
+    2. Если не ответил — "по старинке": полный старый перебор CDN
+       (card.json, price-history.json, price.json). Задержка там может
+       быть больше (часы-дни в зависимости от файла), зато почти не
+       создаёт риска и работает как надёжная подстраховка.
+    """
+    data = _get_price_live(article, retries=retries)
+    if data:
+        return data
+
+    logging.warning(f"[WB] live API не дал цену для {article}, пробую по старинке (CDN)")
+    data = _get_price_cdn_old(article)
+    if data:
+        return data
+
+    logging.error(f"[WB] Не удалось получить цену для {article} (ни live, ни CDN)")
     return None
 
 
@@ -835,7 +920,10 @@ async def check_prices():
     if not items:
         return
 
-    delay_between = max(2, (CHECK_INTERVAL * 60) / len(items) * 0.5)
+    # живой API (card.wb.ru) рискованнее по нагрузке, чем чистый CDN,
+    # поэтому пауза между товарами больше — растягиваем почти на весь
+    # CHECK_INTERVAL, а не бьём WB пачкой за несколько секунд
+    delay_between = max(4, (CHECK_INTERVAL * 60) / len(items) * 0.7)
 
     for item_id, user_id, article, name, old_price, target, mode in items:
         data = get_price(article)
