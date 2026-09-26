@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import random
 import re
 import time
 
@@ -390,7 +389,8 @@ async def help_handler(call: types.CallbackQuery):
         "• <b>Любое снижение</b> — напишет при первом падении.\n"
         "• <b>Мои товары</b> — список, можно удалять.\n\n"
         f"<b>Лимиты:</b> {FREE_TOTAL_LIMIT} добавлений бесплатно, +{REFERRAL_BONUS} за друга. "
-        f"Premium снимает лимит.",
+        f"Premium снимает лимит.\n\n"
+        "⚠️ Показываю <b>цену продавца</b> без скидки WB — точную смотри на сайте.",
         reply_markup=back_kb()
     )
     await call.answer()
@@ -536,7 +536,8 @@ async def add_link(message: types.Message, state: FSMContext):
     await message.answer(
         f"📦 <b>{data['name']}</b>\n"
         f"Артикул: <code>{article}</code>\n"
-        f"Текущая цена: <b>{data['price']} ₽</b>\n\n"
+        f"Цена продавца: <b>{data['price']} ₽</b>\n"
+        f"<i>Точная цена на сайте может быть ниже — учитывается скидка WB.</i>\n\n"
         f"Выбери режим слежки:",
         reply_markup=mode_kb()
     )
@@ -599,7 +600,7 @@ async def list_items(call: types.CallbackQuery):
     kb = []
     for article, name, current, target, mode in items:
         mode_str = f"до {target} ₽" if mode == "target" else "любое снижение"
-        text += f"• <b>{name}</b>\n  Артикул: <code>{article}</code>\n  Текущая: {current} ₽ | {mode_str}\n\n"
+        text += f"• <b>{name}</b>\n  Артикул: <code>{article}</code>\n  Цена продавца: {current} ₽ | {mode_str}\n\n"
         kb.append([InlineKeyboardButton(text=f"🗑 Удалить {article}", callback_data=f"del_{article}")])
     kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -774,6 +775,7 @@ async def check_prices():
                     f"Было: <s>{old_price} ₽</s>\n"
                     f"Стало: <b>{new_price} ₽</b>\n"
                     f"📉 Скидка: <b>−{diff} ₽</b> ({percent}%)\n\n"
+                    f"<i>Цена продавца. Точную смотри на WB.</i>\n"
                     f"https://wildberries.ru/catalog/{article}/detail.aspx"
                 )
             except Exception as e:
