@@ -22,7 +22,9 @@ if not BOT_TOKEN:
         "в настройках хостинга."
     )
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = "UnstableBro"   # твой юзернейм без @
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # можно не задавать
+
 CHECK_INTERVAL = 30
 FREE_CONCURRENT = 3
 PREMIUM_CONCURRENT = 20
@@ -38,6 +40,17 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
+
+
+# ============ ПРОВЕРКА АДМИНА ============
+def is_admin(message_or_call) -> bool:
+    """Админ — по ID (если задан) или по юзернейму."""
+    user = message_or_call.from_user
+    if ADMIN_ID != 0 and user.id == ADMIN_ID:
+        return True
+    if ADMIN_USERNAME and user.username and user.username.lower() == ADMIN_USERNAME.lower():
+        return True
+    return False
 
 
 # ============ БАЗА ДАННЫХ ============
@@ -236,11 +249,30 @@ async def get_total_items():
 
 
 # ============ WILDBERRIES: ЦЕНА ЧЕРЕЗ CDN ============
-def _extract_price_kop(price_obj):
+def _find_working_basket(article):
+    vol = article // 100000
+    part = article // 1000
+    for i in range(1, MAX_BASKET + 1):
+        b = f"{i:02d}"
+        url = f"https://basket-{b}.wbbasket.ru/vol{vol}/part{part}/{article}/info/ru/card.json"
+        try:
+            r = curl_requests.get(url, impersonate="chrome120", timeout=5)
+            if r.status_code == 200:
+                return b
+        except Exception:
+            continue
+    return None
+
+
+def _price_from_obj(price_obj):
     if price_obj is None:
         return None
     if isinstance(price_obj, dict):
-        return price_obj.get("RUB")
+        for k in ("RUB", "rub"):
+            if k in price_obj:
+                return price_obj[k]
+        vals = list(price_obj.values())
+        return vals[0] if vals else None
     return price_obj
 
 
@@ -249,38 +281,43 @@ def get_price(article, retries=2):
     part = article // 1000
 
     for attempt in range(retries):
-        for basket_num in range(1, MAX_BASKET + 1):
-            basket = f"{basket_num:02d}"
+        basket = _find_working_basket(article)
+        if not basket:
+            continue
 
-            name = f"Товар {article}"
-            url_card = (
-                f"https://basket-{basket}.wbbasket.ru"
-                f"/vol{vol}/part{part}/{article}/info/ru/card.json"
-            )
-            try:
-                r = curl_requests.get(url_card, impersonate="chrome120", timeout=8)
-                if r.status_code == 200:
-                    card = r.json()
-                    name = card.get("imt_name") or card.get("subj_name") or name
-            except Exception as e:
-                logging.debug(f"[WB] card.json CDN {basket}: {type(e).__name__}")
+        base = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info"
+        name = f"Товар {article}"
 
-            url_hist = (
-                f"https://basket-{basket}.wbbasket.ru"
-                f"/vol{vol}/part{part}/{article}/info/price-history.json"
-            )
-            try:
-                rh = curl_requests.get(url_hist, impersonate="chrome120", timeout=8)
-                if rh.status_code == 200:
-                    hist = rh.json()
-                    if isinstance(hist, list) and hist:
-                        entry = hist[-1]
-                        price_kop = _extract_price_kop(entry.get("price"))
-                        if price_kop:
-                            logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽")
-                            return {"name": name, "price": price_kop // 100}
-            except Exception as e:
-                logging.debug(f"[WB] price-history CDN {basket}: {type(e).__name__}")
+        try:
+            r = curl_requests.get(f"{base}/ru/card.json", impersonate="chrome120", timeout=8)
+            if r.status_code == 200:
+                card = r.json()
+                name = card.get("imt_name") or card.get("subj_name") or name
+
+                sizes = card.get("sizes", [])
+                if sizes and sizes[0].get("price"):
+                    price_kop = (
+                        sizes[0]["price"].get("product")
+                        or sizes[0]["price"].get("basic")
+                    )
+                    if price_kop:
+                        logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽ (card)")
+                        return {"name": name, "price": price_kop // 100}
+        except Exception as e:
+            logging.debug(f"[WB] card.json CDN {basket}: {type(e).__name__}")
+
+        try:
+            rh = curl_requests.get(f"{base}/price-history.json", impersonate="chrome120", timeout=8)
+            if rh.status_code == 200:
+                hist = rh.json()
+                if isinstance(hist, list) and hist:
+                    entry = hist[-1]
+                    price_kop = _price_from_obj(entry.get("price"))
+                    if price_kop:
+                        logging.info(f"[WB] CDN {basket}: {name} — {price_kop // 100} ₽ (hist)")
+                        return {"name": name, "price": price_kop // 100}
+        except Exception as e:
+            logging.debug(f"[WB] price-history CDN {basket}: {type(e).__name__}")
 
     logging.error(f"[WB] Не удалось получить цену для {article}")
     return None
@@ -430,31 +467,22 @@ async def test_cdn(message: types.Message):
 
     vol = article // 100000
     part = article // 1000
-
-    working_basket = None
-    for i in range(1, MAX_BASKET + 1):
-        b = f"{i:02d}"
-        url = f"https://basket-{b}.wbbasket.ru/vol{vol}/part{part}/{article}/info/ru/card.json"
-        try:
-            r = curl_requests.get(url, impersonate="chrome120", timeout=5)
-            if r.status_code == 200:
-                working_basket = b
-                break
-        except Exception:
-            continue
-
-    if not working_basket:
+    basket = _find_working_basket(article)
+    if not basket:
         await message.answer("❌ Ни один CDN не вернул 200")
         return
 
-    await message.answer(f"✅ CDN: {working_basket}, артикул: {article}, vol={vol}, part={part}")
+    base = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info"
+    await message.answer(f"✅ CDN {basket}, артикул {article}")
 
-    url_hist = f"https://basket-{working_basket}.wbbasket.ru/vol{vol}/part{part}/{article}/info/price-history.json"
-    try:
-        rh = curl_requests.get(url_hist, impersonate="chrome120", timeout=10)
-        await message.answer(f"<b>price-history</b> ({rh.status_code}):\n<pre>{rh.text[:3800]}</pre>")
-    except Exception as e:
-        await message.answer(f"Ошибка: {type(e).__name__}: {e}")
+    for fname in ("ru/card.json", "price-history.json"):
+        try:
+            r = curl_requests.get(f"{base}/{fname}", impersonate="chrome120", timeout=10)
+            await message.answer(
+                f"<b>{fname}</b> ({r.status_code}, {len(r.text)}):\n<pre>{r.text[:3500]}</pre>"
+            )
+        except Exception as e:
+            await message.answer(f"{fname}: {type(e).__name__}: {e}")
 
 
 # --- Добавление ---
@@ -667,20 +695,19 @@ async def on_payment(message: types.Message):
     )
 
 
-# --- Админ: выдать Premium ---
+# ============ АДМИН-КОМАНДЫ (по юзернейму) ============
 @dp.message(Command("grant"))
 async def grant(message: types.Message):
-    if ADMIN_ID == 0 or message.from_user.id != ADMIN_ID:
+    if not is_admin(message):
         return
     await ensure_user(message.from_user.id)
     await set_premium(message.from_user.id, days=PREMIUM_DAYS)
     await message.answer(f"✅ Premium выдан на {PREMIUM_DAYS} дней (тест).")
 
 
-# --- Админ: сбросить счётчики ---
 @dp.message(Command("reset"))
 async def reset_user(message: types.Message):
-    if ADMIN_ID == 0 or message.from_user.id != ADMIN_ID:
+    if not is_admin(message):
         return
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -691,31 +718,9 @@ async def reset_user(message: types.Message):
     await message.answer("✅ Счётчики сброшены.")
 
 
-# --- Админ: статистика ---
-@dp.message(Command("stats"))
-async def stats(message: types.Message):
-    if ADMIN_ID == 0 or message.from_user.id != ADMIN_ID:
-        return
-
-    total = await get_total_users()
-    active = await get_active_users()
-    premium = await get_premium_users()
-    items = await get_total_items()
-
-    text = (
-        "📊 <b>Статистика бота</b>\n\n"
-        f"👥 Всего пользователей: <b>{total}</b>\n"
-        f"✅ Активных (есть товары): <b>{active}</b>\n"
-        f"⭐ Premium: <b>{premium}</b>\n"
-        f"📦 Товаров в слежке: <b>{items}</b>\n"
-    )
-    await message.answer(text)
-
-
-# --- Админ: завысить цену ---
 @dp.message(Command("fake"))
 async def fake_price(message: types.Message):
-    if ADMIN_ID == 0 or message.from_user.id != ADMIN_ID:
+    if not is_admin(message):
         return
     items = await get_user_items(message.from_user.id)
     if not items:
@@ -733,14 +738,33 @@ async def fake_price(message: types.Message):
     )
 
 
-# --- Админ: принудительная проверка ---
 @dp.message(Command("check"))
 async def force_check(message: types.Message):
-    if ADMIN_ID == 0 or message.from_user.id != ADMIN_ID:
+    if not is_admin(message):
         return
     await message.answer("🔍 Запускаю проверку цен...")
     await check_prices()
     await message.answer("✅ Проверка завершена. Смотри уведомления.")
+
+
+@dp.message(Command("stats"))
+async def stats(message: types.Message):
+    if not is_admin(message):
+        return
+
+    total = await get_total_users()
+    active = await get_active_users()
+    premium = await get_premium_users()
+    items = await get_total_items()
+
+    text = (
+        "📊 <b>Статистика бота</b>\n\n"
+        f"👥 Всего пользователей: <b>{total}</b>\n"
+        f"✅ Активных (есть товары): <b>{active}</b>\n"
+        f"⭐ Premium: <b>{premium}</b>\n"
+        f"📦 Товаров в слежке: <b>{items}</b>\n"
+    )
+    await message.answer(text)
 
 
 # ============ ФОНОВАЯ ПРОВЕРКА ============
